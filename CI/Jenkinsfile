@@ -1,0 +1,153 @@
+// Jenkins pipeline: build single image -> push to ECR -> redeploy ECS service.
+//
+// Each run REGISTERS A NEW REVISION of the 'python-td' task definition family:
+// it takes the current revision as a base, swaps in the image built this run
+// (pinned to the commit-SHA tag), strips the read-only fields, registers the new
+// revision, and points the service at it. So python-td:1 -> :2 -> :3 ... per
+// build, each pinned to an immutable image (clean rollback targets).
+//
+// Requirements on the Jenkins agent:
+//   - docker CLI, aws CLI v2, jq
+//   - IAM permissions: ECR push, ecs:DescribeTaskDefinition,
+//     ecs:RegisterTaskDefinition, ecs:UpdateService, ecs:DescribeServices, and
+//     iam:PassRole on the task's execution role (and task role, if any).
+//   - AWS auth: easiest is an IAM instance profile on the agent. If you instead
+//     store credentials in Jenkins, see the commented "withCredentials" block.
+
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION      = 'us-east-1'                // <-- change to your region
+        ECR_REPOSITORY  = 'python-app'          // <-- your ECR repo name
+        ECS_CLUSTER     = 'python-task-cluster'      // <-- your ECS cluster name
+        ECS_SERVICE     = 'python-task-service'      // <-- your ECS service name
+        ECS_TASK_FAMILY = 'python-td'                // <-- ECS task definition family
+        CONTAINER_NAME  = 'Main'                     // must match containerDefinitions[].name
+
+        IMAGE_TAG       = "${env.GIT_COMMIT ?: env.BUILD_NUMBER}"
+
+        // Keep the Docker credential file in the workspace so `docker login` and
+        // `docker push` share it regardless of the agent user's $HOME. This is
+        // the usual fix for "no basic auth credentials" on push.
+        DOCKER_CONFIG   = "${env.WORKSPACE}/.docker"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Resolve ECR registry') {
+            steps {
+                script {
+                    env.AWS_ACCOUNT_ID = sh(
+                        script: "aws sts get-caller-identity --query Account --output text",
+                        returnStdout: true
+                    ).trim()
+                    env.ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+                    env.IMAGE_URI    = "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:${env.IMAGE_TAG}"
+                    echo "Image: ${env.IMAGE_URI}"
+                }
+            }
+        }
+
+        stage('Build & push image') {
+            steps {
+                // Login, build, and push in a SINGLE shell so the ECR
+                // credentials written by `docker login` are guaranteed present
+                // for `docker push` (separate stages/shells can lose them).
+                sh '''
+                    set -e
+                    mkdir -p "$DOCKER_CONFIG"
+
+                    aws ecr get-login-password --region "$AWS_REGION" \
+                      | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+                    docker build -t "$IMAGE_URI" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+                    docker push "$IMAGE_URI"
+                    docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+                '''
+            }
+        }
+
+        stage('Register new task definition revision') {
+            steps {
+                sh '''
+                    set -e
+
+                    # 1) Take the current revision as the base.
+                    aws ecs describe-task-definition \
+                      --task-definition "$ECS_TASK_FAMILY" \
+                      --region "$AWS_REGION" \
+                      --query 'taskDefinition' > current-taskdef.json
+
+                    # 2) Swap in THIS build's image (pinned to the SHA tag) and
+                    #    drop the read-only fields register-task-definition rejects.
+                    jq --arg IMAGE "$IMAGE_URI" --arg NAME "$CONTAINER_NAME" '
+                        (.containerDefinitions[] | select(.name == $NAME) | .image) = $IMAGE
+                        | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                              .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+                    ' current-taskdef.json > new-taskdef.json
+
+                    # 3) Register the new revision and capture its ARN.
+                    NEW_TD_ARN=$(aws ecs register-task-definition \
+                      --cli-input-json file://new-taskdef.json \
+                      --region "$AWS_REGION" \
+                      --query 'taskDefinition.taskDefinitionArn' --output text)
+                    echo "Registered new revision: $NEW_TD_ARN"
+
+                    # Hand the ARN to the next stage.
+                    echo "$NEW_TD_ARN" > .new-td-arn
+                '''
+            }
+        }
+
+        stage('Deploy to ECS') {
+            steps {
+                sh '''
+                    set -e
+                    NEW_TD_ARN=$(cat .new-td-arn)
+
+                    # Point the service at the new revision and roll it out.
+                    aws ecs update-service \
+                      --cluster "$ECS_CLUSTER" \
+                      --service "$ECS_SERVICE" \
+                      --task-definition "$NEW_TD_ARN" \
+                      --region "$AWS_REGION" > /dev/null
+
+                    # Wait until the deployment stabilizes.
+                    aws ecs wait services-stable \
+                      --cluster "$ECS_CLUSTER" \
+                      --services "$ECS_SERVICE" \
+                      --region "$AWS_REGION"
+                    echo "Deployment stable on $NEW_TD_ARN"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout "$ECR_REGISTRY" || true'
+            cleanWs()
+        }
+        success { echo "Deployed ${env.IMAGE_URI} to ${env.ECS_SERVICE}." }
+        failure { echo 'Pipeline failed. Check the stage logs above.' }
+    }
+}
+
+// ── Using Jenkins-stored AWS credentials instead of an instance role ─────────
+// If the agent has no IAM instance profile, wrap the AWS stages in:
+//
+//   withCredentials([usernamePassword(
+//       credentialsId: 'aws-deploy-creds',
+//       usernameVariable: 'AWS_ACCESS_KEY_ID',
+//       passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+//     // sh '...' aws commands here ...
+//   }
+//
+// Create 'aws-deploy-creds' (Username with password) under
+// Manage Jenkins > Credentials.
