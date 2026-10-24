@@ -19,6 +19,7 @@ def home():
             "GET  /tasks": "List all tasks",
             "POST /tasks": "Create a new task",
             "GET  /tasks/<id>": "Get a task by ID",
+            "PATCH /tasks/<id>": "Update a task (done, title, description)",
             "DELETE /tasks/<id>": "Delete a task by ID",
         }
     })
@@ -63,6 +64,30 @@ def get_task(task_id):
     task = next((t for t in tasks if t["id"] == task_id), None)
     if task is None:
         return jsonify({"error": f"Task {task_id} not found"}), 404
+    return jsonify(task)
+
+
+@app.route("/tasks/<int:task_id>", methods=["PATCH"])
+def update_task(task_id):
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if task is None:
+        return jsonify({"error": f"Task {task_id} not found"}), 404
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+
+    if "done" in data:
+        if not isinstance(data["done"], bool):
+            return jsonify({"error": "'done' must be a boolean"}), 400
+        task["done"] = data["done"]
+    if "title" in data:
+        if not str(data["title"]).strip():
+            return jsonify({"error": "'title' cannot be empty"}), 400
+        task["title"] = data["title"]
+    if "description" in data:
+        task["description"] = data["description"]
+
     return jsonify(task)
 
 

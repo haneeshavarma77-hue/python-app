@@ -68,7 +68,7 @@ curl -X DELETE http://localhost:5000/tasks/1
 
 ---
 
-## Deploy to AWS ECS (single image via ECR + GitHub Actions)
+## Deploy to AWS ECS (single combined image)
 
 For production, the app ships as **one Docker image** that runs both the Flask
 API (port 5000) and the Streamlit UI (port 8501), supervised by `supervisord`.
@@ -90,39 +90,69 @@ docker run -p 5000:5000 -p 8501:8501 python-task-app
 # API: http://localhost:5000
 ```
 
-### Files
+### Shared files
 
 | File | Purpose |
 |------|---------|
 | `Dockerfile` | Single combined image (Flask + Streamlit) |
 | `deploy/supervisord.conf` | Runs both processes in the container |
 | `deploy/ecs-task-definition.json` | Fargate task definition template |
-| `.github/workflows/deploy.yml` | CI/CD: build → push to ECR → deploy to ECS |
 
-### One-time AWS setup
+How you ship that image to ECS is up to you — pick a CI/CD provider below.
 
-1. **ECR repository**
-   ```bash
-   aws ecr create-repository --repository-name python-task-app
-   ```
-2. **ECS cluster + service** (Fargate) named to match the workflow `env` block
-   (`python-task-cluster` / `python-task-service`), fronted by a load balancer
-   if you want public access to ports 5000 and 8501.
-3. **IAM roles**
-   - `ecsTaskExecutionRole` — lets ECS pull from ECR and write CloudWatch logs.
-   - A **GitHub OIDC deploy role** — trusted by `token.actions.githubusercontent.com`,
-     with permissions for ECR push, ECS update, and `iam:PassRole` on the
-     execution role.
+---
 
-### GitHub repository secrets
+## CI/CD Options (educational)
 
-| Secret | Value |
-|--------|-------|
-| `AWS_DEPLOY_ROLE_ARN` | ARN of the GitHub OIDC deploy role |
-| `ECS_EXECUTION_ROLE_ARN` | ARN of `ecsTaskExecutionRole` |
+This repo intentionally ships several ways to build and deploy the same image,
+so you can compare them. The first three are standalone; the last two are
+variations on where the build actually runs.
 
-### Workflow config
+| Option | File | Build runs on | Best for |
+|--------|------|---------------|----------|
+| AWS CodeBuild / CodePipeline | `ci/codebuild/buildspec.yml` | AWS-managed build | Staying fully inside AWS |
+| GitHub Actions (hosted) | `.github/workflows/deploy.yml` | GitHub-hosted runners | GitHub-native, OIDC, no servers to manage |
+| Jenkins on EC2 | `ci/jenkins/Jenkinsfile` | The Jenkins EC2 Docker daemon | Self-hosted control, on-prem parity |
+| **Jenkins → CodeBuild** | `ci/jenkins/Jenkinsfile` + `ci/codebuild/buildspec.yml` | AWS CodeBuild (triggered by Jenkins) | Jenkins orchestration without a build fleet |
+| **GitHub Actions self-hosted runner** | `.github/workflows/deploy.yml` | Your own runner (e.g. EC2) | Private networking, custom build hardware |
 
-Edit the `env:` block at the top of `.github/workflows/deploy.yml` to match your
-AWS region, ECR repo, ECS cluster, and service names. Pushing to `main` then
-builds the image, pushes it to ECR, and rolls out a new ECS deployment.
+All of them produce the same result: build the single combined image, push it to
+ECR, register a new ECS task definition revision, and roll out the service.
+They differ only in **who orchestrates** and **where the Docker build executes**.
+
+### Per-provider setup guides
+
+Each provider has its own folder with the config file **and** a full setup guide:
+
+| Provider | Config | Guide |
+|----------|--------|-------|
+| AWS CodeBuild | `ci/codebuild/buildspec.yml` | [`ci/codebuild/README.md`](ci/codebuild/README.md) |
+| Jenkins on EC2 (+ Jenkins→CodeBuild) | `ci/jenkins/Jenkinsfile` | [`ci/jenkins/README.md`](ci/jenkins/README.md) |
+| GitHub Actions (+ self-hosted runner) | `.github/workflows/deploy.yml` | [`ci/github-actions/README.md`](ci/github-actions/README.md) |
+
+### Where the CI/CD files live
+
+```
+python-app/
+├── ci/
+│   ├── codebuild/
+│   │   ├── buildspec.yml        # AWS CodeBuild build spec
+│   │   └── README.md            # CodeBuild setup guide
+│   ├── jenkins/
+│   │   ├── Jenkinsfile          # Jenkins pipeline
+│   │   └── README.md            # Jenkins setup guide (+ Jenkins→CodeBuild)
+│   └── github-actions/
+│       └── README.md            # GitHub Actions setup guide (+ self-hosted runner)
+└── .github/
+    └── workflows/
+        └── deploy.yml           # GitHub Actions workflow (must stay here — GitHub
+                                 #   only discovers workflows under .github/workflows/)
+```
+
+`Dockerfile` and `docker-compose.yml` stay at the repo root because they're the
+shared build definition every pipeline (and local dev) uses. The CI configs use a
+build context of `.` and paths relative to the repo root, so they keep working
+from their folders — CI systems check out the whole repo and run from the root.
+
+The GitHub Actions **workflow YAML** must stay in `.github/workflows/`; only its
+documentation lives under `ci/github-actions/`.

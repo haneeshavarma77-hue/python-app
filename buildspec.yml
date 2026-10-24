@@ -1,0 +1,41 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: us-east-1
+    ECR_REPO: python-app           # ECR repository name
+    CONTAINER_NAME: Main      # MUST match container name in task definition
+
+phases:
+  pre_build:
+    commands:
+      - echo Verifying AWS identity...
+      - aws sts get-caller-identity
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - REPO_URI=$REGISTRY/$ECR_REPO
+      - echo "ACCOUNT_ID=$ACCOUNT_ID REGION=$AWS_REGION REGISTRY=$REGISTRY"
+      - echo Verifying Docker daemon...
+      - docker info > /dev/null
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${IMAGE_TAG:=latest}
+
+  build:
+    commands:
+      - echo Checking Docker daemon before build...
+      - docker version
+      - echo Building $REPO_URI:$IMAGE_TAG
+      - docker build -t $REPO_URI:$IMAGE_TAG -t $REPO_URI:latest .
+
+  post_build:
+    commands:
+      - docker push $REPO_URI:$IMAGE_TAG
+      - docker push $REPO_URI:latest
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$REPO_URI:$IMAGE_TAG" > imagedefinitions.json
+      - cat imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
