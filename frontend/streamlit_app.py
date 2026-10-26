@@ -4,7 +4,7 @@ import os
 
 # ── Config ──────────────────────────────────────────────────────────────────
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:5000")
-APP_VERSION = "v3"
+APP_VERSION = "v6"
 
 st.set_page_config(
     page_title="Task Manager",
